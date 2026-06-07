@@ -1,0 +1,195 @@
+<?php
+namespace App\Http\Controllers;
+
+use Illuminate\Http\Request;
+use App\Models\User;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Password;
+use Illuminate\Auth\Events\PasswordReset;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
+
+class AuthController extends Controller
+{
+    public function register(Request $request)
+    {
+        $request->validate([
+            'name' => 'required|string|max:255',
+            'email' => 'required|string|email|max:255|unique:users',
+            'password' => 'required|string|min:8|confirmed',
+            'phone' => 'nullable|string',
+            'address_line1' => 'nullable|string',
+            'city' => 'nullable|string',
+            'state' => 'nullable|string',
+            'zip_code' => 'nullable|string',
+        ]);
+
+        $user = User::create([
+            'name' => $request->name,
+            'email' => $request->email,
+            'password' => Hash::make($request->password),
+            'phone' => $request->phone,
+        ]);
+
+        if ($request->address_line1) {
+            \App\Models\Address::create([
+                'user_id' => $user->id,
+                'address_line1' => $request->address_line1,
+                'city' => $request->city ?? '',
+                'state' => $request->state ?? '',
+                'zip_code' => $request->zip_code ?? '',
+                'country' => 'Zambia',
+            ]);
+        } else {
+            $user->notify(new \App\Notifications\AccountSetupReminder());
+        }
+
+        $user->load('addresses');
+        $token = $user->createToken('auth_token')->plainTextToken;
+        return response()->json(['access_token' => $token, 'token_type' => 'Bearer', 'user' => $user]);
+    }
+
+    public function login(Request $request)
+    {
+        $request->validate([
+            'email' => 'required|email',
+            'password' => 'required',
+        ]);
+
+        $user = User::where('email', $request->email)->first();
+
+        if (!$user || !Hash::check($request->password, $user->password)) {
+            throw ValidationException::withMessages(['email' => ['Invalid credentials']]);
+        }
+
+        $token = $user->createToken('auth_token')->plainTextToken;
+        return response()->json(['access_token' => $token, 'token_type' => 'Bearer', 'user' => $user]);
+    }
+
+    public function logout(Request $request)
+    {
+        $request->user()->currentAccessToken()->delete();
+        return response()->json(['message' => 'Logged out successfully']);
+    }
+
+    public function forgotPassword(Request $request)
+    {
+        $request->validate(['email' => 'required|email']);
+        
+        $status = Password::sendResetLink(
+            $request->only('email'),
+            function ($user, $token) {
+                // Generate a custom URL for the frontend
+                $frontendUrl = env('FRONTEND_URL', 'http://localhost:3000');
+                $url = $frontendUrl . '/reset-password?token=' . $token . '&email=' . urlencode($user->email);
+                
+                // We're utilizing Laravel's default ResetPassword notification which accepts a URL callback
+                // Wait, easiest is to just dispatch the notification
+                $user->sendPasswordResetNotification($token);
+            }
+        );
+
+        return $status === Password::RESET_LINK_SENT
+            ? response()->json(['message' => __($status)])
+            : response()->json(['message' => __($status)], 400);
+    }
+
+    public function resetPassword(Request $request)
+    {
+        $request->validate([
+            'token' => 'required',
+            'email' => 'required|email',
+            'password' => 'required|min:8|confirmed',
+        ]);
+
+        $status = Password::reset(
+            $request->only('email', 'password', 'password_confirmation', 'token'),
+            function ($user, $password) {
+                $user->forceFill([
+                    'password' => Hash::make($password)
+                ])->setRememberToken(Str::random(60));
+
+                $user->save();
+                event(new PasswordReset($user));
+            }
+        );
+
+        return $status === Password::PASSWORD_RESET
+            ? response()->json(['message' => __($status)])
+            : response()->json(['message' => __($status)], 400);
+    }
+
+    public function updateProfile(Request $request)
+    {
+        $request->validate([
+            'name' => 'required|string|max:255',
+            'email' => 'required|string|email|max:255|unique:users,email,' . $request->user()->id,
+            'phone' => 'nullable|digits:10',
+        ]);
+
+        $user = $request->user();
+        $user->name = $request->name;
+        $user->email = $request->email;
+        if ($request->has('phone')) {
+            $user->phone = $request->phone;
+        }
+        $user->save();
+        
+        $user->load('addresses');
+
+        return response()->json(['message' => 'Profile updated successfully', 'user' => $user]);
+    }
+
+    public function updateAddress(Request $request)
+    {
+        $request->validate([
+            'address_line1' => 'required|string',
+            'city' => 'required|string',
+            'state' => 'required|string',
+            'zip_code' => 'required|string',
+        ]);
+
+        $user = $request->user();
+        
+        $address = $user->addresses()->first();
+        if ($address) {
+            $address->update($request->only('address_line1', 'city', 'state', 'zip_code'));
+        } else {
+            $user->addresses()->create(array_merge($request->only('address_line1', 'city', 'state', 'zip_code'), ['country' => 'Zambia']));
+        }
+        
+        $user->load('addresses');
+        return response()->json(['message' => 'Address updated successfully', 'user' => $user]);
+    }
+
+    public function setupPassword(Request $request)
+    {
+        $request->validate([
+            'password' => 'required|string|min:8|confirmed',
+        ]);
+
+        $user = $request->user();
+        $user->password = bcrypt($request->password);
+        $user->save();
+
+        return response()->json(['message' => 'Password set successfully', 'user' => $user]);
+    }
+
+    public function deleteAccount(Request $request)
+    {
+        $request->validate([
+            'password' => 'required|string',
+        ]);
+
+        $user = $request->user();
+
+        if (!Hash::check($request->password, $user->password)) {
+            return response()->json(['message' => 'Incorrect password.'], 400);
+        }
+
+        $request->user()->currentAccessToken()->delete();
+        $user->delete();
+
+        return response()->json(['message' => 'Account deleted successfully.']);
+    }
+}
